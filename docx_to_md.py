@@ -3,11 +3,9 @@
 DOCX to Markdown Exam Converter
 Converts Word document exams into the markdown format required by md_to_jenzabar.py.
 
-Supports common exam formats:
-- Numbered questions (1. or 1) or **1.)
-- Lettered choices (A. or a. or A) or a))
-- Answer lines with various formats
-- True/False questions
+Supports:
+- Cengage test bank exports (table-based with nested tables for choices/answers)
+- Standard paragraph-based exam formats (numbered questions with lettered choices)
 
 Usage:
     python docx_to_md.py exam.docx
@@ -29,42 +27,110 @@ except ImportError:
     sys.exit(1)
 
 
-def extract_text_from_docx(docx_path):
-    """Extract all text from a DOCX file, preserving paragraph breaks."""
-    doc = Document(docx_path)
+# Metadata fields to strip (only keep ANSWER and RATIONALE)
+STRIP_FIELDS = {
+    'POINTS', 'QUESTION TYPE', 'HAS VARIABLES', 'LEARNING OBJECTIVES',
+    'ACCREDITING STANDARDS', 'TOPICS', 'KEYWORDS', 'DATE CREATED',
+    'DATE MODIFIED', 'DIFFICULTY', 'REFERENCES', 'OTHER', 'NOTES',
+    'SECTION', 'CHAPTER', 'PAGE', 'OBJECTIVE', 'SKILL', 'LEVEL',
+}
+
+
+def parse_cengage_table_format(doc):
+    """Parse Cengage test bank DOCX format (table-based with nested tables)."""
+    questions = []
+
+    for ti, table in enumerate(doc.tables):
+        # Each top-level table is one question
+        if len(table.rows) == 0 or len(table.columns) == 0:
+            continue
+
+        cell = table.cell(0, 0)
+
+        # Get question text from cell paragraphs
+        question_text = ''
+        for p in cell.paragraphs:
+            text = p.text.strip()
+            if text:
+                # Clean up non-breaking spaces
+                text = text.replace('\xa0', ' ')
+                question_text += text + ' '
+
+        question_text = question_text.strip()
+        if not question_text:
+            continue
+
+        # Extract question number and clean text
+        q_match = re.match(r'^(\d+)\.\s*(.+)$', question_text)
+        if q_match:
+            q_num = int(q_match.group(1))
+            q_text = q_match.group(2).strip()
+        else:
+            q_num = ti + 1
+            q_text = question_text
+
+        # Parse nested tables for choices and metadata
+        choices = []
+        answer = None
+        rationale = None
+        q_type_from_doc = None
+
+        if cell.tables:
+            for nested_table in cell.tables:
+                for row in nested_table.rows:
+                    cells_text = []
+                    for c in row.cells:
+                        cells_text.append(c.text.strip().replace('\xa0', ' '))
+
+                    # Detect choice rows (have letter like a. b. c. in column 1)
+                    if len(cells_text) >= 3:
+                        letter_match = re.match(r'^([a-eA-E])\.?$', cells_text[1].strip())
+                        if letter_match and cells_text[2].strip():
+                            choices.append({
+                                'letter': letter_match.group(1).upper(),
+                                'text': cells_text[2].strip()
+                            })
+                            continue
+
+                    # Detect metadata rows (label in column 0, value in column 1)
+                    if len(cells_text) >= 2:
+                        label = cells_text[0].strip().rstrip(':').upper().replace('\xa0', ' ')
+                        value = cells_text[1].strip()
+
+                        if label == 'ANSWER':
+                            answer = value.upper()
+                        elif label == 'RATIONALE':
+                            rationale = value
+                        elif label == 'QUESTION TYPE':
+                            q_type_from_doc = value
+                        # Skip all other metadata fields (POINTS, KEYWORDS, etc.)
+
+        if not answer:
+            continue
+
+        questions.append({
+            'num': q_num,
+            'text': q_text,
+            'choices': choices,
+            'answer': answer,
+            'rationale': rationale or '',
+            'doc_type': q_type_from_doc
+        })
+
+    return questions
+
+
+def parse_paragraph_format(doc):
+    """Parse standard paragraph-based exam format."""
     lines = []
     for para in doc.paragraphs:
-        text = para.text.strip()
+        text = para.text.strip().replace('\xa0', ' ')
         if text:
             lines.append(text)
-    return lines
 
+    if not lines:
+        return []
 
-def detect_format(lines):
-    """Detect the exam format used in the document."""
-    patterns = {
-        'q_bold_num': re.compile(r'^\*\*\d+[\.\)]\s'),       # **1. or **1)
-        'q_plain_num': re.compile(r'^\d+[\.\)]\s'),            # 1. or 1)
-        'q_paren_num': re.compile(r'^\(\d+\)\s'),              # (1)
-        'choice_letter_dot': re.compile(r'^[A-Ea-e]\.\s'),     # A. or a.
-        'choice_letter_paren': re.compile(r'^[A-Ea-e]\)\s'),   # A) or a)
-        'choice_paren_letter': re.compile(r'^\([A-Ea-e]\)\s'), # (A) or (a)
-        'answer_bold': re.compile(r'^\*\*Answer:', re.IGNORECASE),
-        'answer_plain': re.compile(r'^Answer:', re.IGNORECASE),
-        'answer_key': re.compile(r'^(Correct Answer|ANSWER|Key):', re.IGNORECASE),
-    }
-
-    counts = {k: 0 for k in patterns}
-    for line in lines:
-        for name, pat in patterns.items():
-            if pat.match(line):
-                counts[name] += 1
-
-    return counts
-
-
-def parse_docx_exam(lines):
-    """Parse exam lines into structured question data."""
     questions = []
     current_question = None
     current_num = 0
@@ -72,34 +138,27 @@ def parse_docx_exam(lines):
     current_answer = None
     current_rationale = None
 
-    # Question patterns (ordered by specificity)
     q_patterns = [
-        re.compile(r'^\*?\*?(\d+)[\.\)]\s*(.+?)[\*]*$'),   # 1. or **1. or 1)
-        re.compile(r'^\((\d+)\)\s*(.+)$'),                   # (1)
-        re.compile(r'^Question\s+(\d+)[:\.\)]\s*(.+)$', re.IGNORECASE),  # Question 1:
+        re.compile(r'^\*?\*?(\d+)[\.\)]\s*(.+?)[\*]*$'),
+        re.compile(r'^\((\d+)\)\s*(.+)$'),
+        re.compile(r'^Question\s+(\d+)[:\.\)]\s*(.+)$', re.IGNORECASE),
     ]
 
-    # Choice patterns
     choice_patterns = [
-        re.compile(r'^([A-Ea-e])\.\s+(.+)$'),               # A. text
-        re.compile(r'^([A-Ea-e])\)\s+(.+)$'),               # A) text
-        re.compile(r'^\(([A-Ea-e])\)\s+(.+)$'),             # (A) text
+        re.compile(r'^([A-Ea-e])\.\s+(.+)$'),
+        re.compile(r'^([A-Ea-e])\)\s+(.+)$'),
+        re.compile(r'^\(([A-Ea-e])\)\s+(.+)$'),
     ]
 
-    # Answer patterns
     answer_patterns = [
         re.compile(r'^\*?\*?Answer:\s*([A-Ea-e,\s]+|TRUE|FALSE)\*?\*?$', re.IGNORECASE),
         re.compile(r'^Correct Answer:\s*([A-Ea-e,\s]+|TRUE|FALSE)$', re.IGNORECASE),
         re.compile(r'^ANSWER:\s*([A-Ea-e,\s]+|TRUE|FALSE)$', re.IGNORECASE),
-        re.compile(r'^Key:\s*([A-Ea-e,\s]+|TRUE|FALSE)$', re.IGNORECASE),
     ]
 
-    # Rationale patterns
     rationale_patterns = [
         re.compile(r'^\*?\*?Rationale:\*?\*?\s*(.+)$', re.IGNORECASE),
         re.compile(r'^Explanation:\s*(.+)$', re.IGNORECASE),
-        re.compile(r'^Feedback:\s*(.+)$', re.IGNORECASE),
-        re.compile(r'^Why:\s*(.+)$', re.IGNORECASE),
     ]
 
     def save_question():
@@ -109,44 +168,39 @@ def parse_docx_exam(lines):
                 'num': current_num,
                 'text': current_question,
                 'choices': current_choices,
-                'answer': current_answer,
-                'rationale': current_rationale or ''
+                'answer': current_answer.upper(),
+                'rationale': current_rationale or '',
+                'doc_type': None
             })
         current_question = None
         current_choices = []
         current_answer = None
         current_rationale = None
 
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-
-        # Check for question start
+    for line in lines:
+        # Check for question
         q_match = None
         for pat in q_patterns:
             q_match = pat.match(line)
             if q_match:
                 break
-
         if q_match:
             save_question()
             current_num = int(q_match.group(1))
             current_question = q_match.group(2).strip().rstrip('*')
-            i += 1
             continue
 
-        # Check for choices
+        # Check for choice
         choice_match = None
         for pat in choice_patterns:
             choice_match = pat.match(line)
             if choice_match:
                 break
-
         if choice_match:
-            letter = choice_match.group(1).upper()
-            text = choice_match.group(2).strip()
-            current_choices.append({'letter': letter, 'text': text})
-            i += 1
+            current_choices.append({
+                'letter': choice_match.group(1).upper(),
+                'text': choice_match.group(2).strip()
+            })
             continue
 
         # Check for answer
@@ -155,10 +209,8 @@ def parse_docx_exam(lines):
             answer_match = pat.match(line)
             if answer_match:
                 break
-
         if answer_match:
-            current_answer = answer_match.group(1).strip().upper()
-            i += 1
+            current_answer = answer_match.group(1).strip()
             continue
 
         # Check for rationale
@@ -167,35 +219,32 @@ def parse_docx_exam(lines):
             rat_match = pat.match(line)
             if rat_match:
                 break
-
         if rat_match:
             current_rationale = rat_match.group(1).strip()
-            # Continue reading multi-line rationale
-            i += 1
-            while i < len(lines):
-                next_line = lines[i]
-                # Stop if we hit a new question, separator, or answer
-                is_new_q = any(p.match(next_line) for p in q_patterns)
-                is_separator = next_line.strip() in ('---', '___', '***', '')
-                is_answer = any(p.match(next_line) for p in answer_patterns)
-                if is_new_q or is_separator or is_answer:
-                    break
-                current_rationale += ' ' + next_line.strip()
-                i += 1
             continue
 
-        # If we have a current question and no choices yet, this might be
-        # a continuation of the question text
-        if current_question and not current_choices and not current_answer:
-            if line and line not in ('---', '___', '***'):
-                current_question += ' ' + line.strip()
-
-        i += 1
-
-    # Save last question
     save_question()
-
     return questions
+
+
+def detect_format(doc):
+    """Detect if this is a table-based (Cengage) or paragraph-based format."""
+    # If there are tables with nested tables, it is likely Cengage format
+    if doc.tables:
+        cell = doc.tables[0].cell(0, 0) if doc.tables[0].rows else None
+        if cell and cell.tables:
+            return 'cengage'
+
+    # Check for paragraph content
+    has_paragraphs = any(p.text.strip() for p in doc.paragraphs)
+    if has_paragraphs:
+        return 'paragraph'
+
+    # Fallback: check if tables have question-like content
+    if doc.tables:
+        return 'cengage'
+
+    return 'unknown'
 
 
 def questions_to_markdown(questions, title):
@@ -206,15 +255,17 @@ def questions_to_markdown(questions, title):
         md_lines.append(f"**{q['num']}. {q['text']}**")
         md_lines.append("")
 
-        if q['answer'].upper() in ('TRUE', 'FALSE'):
-            # True/False - no choices needed
+        answer = q['answer'].strip()
+
+        if answer in ('TRUE', 'FALSE'):
+            # True/False question, no choices
             pass
         else:
             for choice in q['choices']:
                 md_lines.append(f"{choice['letter']}. {choice['text']}")
             md_lines.append("")
 
-        md_lines.append(f"**Answer: {q['answer']}**")
+        md_lines.append(f"**Answer: {answer}**")
         md_lines.append("")
 
         if q['rationale']:
@@ -234,19 +285,27 @@ def convert_docx_to_md(docx_path, output_dir=None):
         return None
 
     print(f"Reading: {docx_path}")
-    lines = extract_text_from_docx(docx_path)
-    print(f"  Extracted {len(lines)} lines of text")
+    doc = Document(docx_path)
 
-    # Try to get title from first line
-    title = lines[0] if lines else os.path.splitext(os.path.basename(docx_path))[0]
-    # Clean up title (remove # if present)
-    title = re.sub(r'^#+\s*', '', title).strip()
+    # Detect format
+    fmt = detect_format(doc)
+    print(f"  Detected format: {fmt}")
 
-    questions = parse_docx_exam(lines)
+    if fmt == 'cengage':
+        questions = parse_cengage_table_format(doc)
+    elif fmt == 'paragraph':
+        questions = parse_paragraph_format(doc)
+    else:
+        print("  WARNING: Could not detect exam format.")
+        # Try both and use whichever finds more questions
+        q1 = parse_cengage_table_format(doc)
+        q2 = parse_paragraph_format(doc)
+        questions = q1 if len(q1) >= len(q2) else q2
+
     print(f"  Parsed {len(questions)} questions")
 
     if not questions:
-        print("  WARNING: No questions found. Check that the document follows a recognizable exam format.")
+        print("  WARNING: No questions found.")
         return None
 
     # Count types
@@ -256,6 +315,10 @@ def convert_docx_to_md(docx_path, output_dir=None):
     print(f"  - Multiple Choice: {mc_count}")
     print(f"  - Multiple Answer: {multi_count}")
     print(f"  - True/False: {tf_count}")
+
+    # Title from filename
+    title = os.path.splitext(os.path.basename(docx_path))[0]
+    title = title.replace('_', ' ')
 
     md_content = questions_to_markdown(questions, title)
 
@@ -280,6 +343,8 @@ if __name__ == '__main__':
         print("Usage: python docx_to_md.py <exam.docx> [output_folder]")
         print("")
         print("Converts a Word document exam to markdown format.")
+        print("Supports Cengage test bank exports and standard exam formats.")
+        print("")
         print("The markdown file can then be converted to a Jenzabar cartridge with:")
         print("  python md_to_jenzabar.py <exam.md>")
         sys.exit(1)
